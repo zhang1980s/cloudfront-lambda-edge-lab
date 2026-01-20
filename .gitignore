@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# CDK
+cdk/cdk.out/
+cdk/dist/
+*.js
+*.d.ts
+!cloudfront-function/bot-validator.js
+!lambda-edge/index.js
+!test/test-requests.sh
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
