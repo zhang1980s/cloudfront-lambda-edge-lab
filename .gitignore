@@ -4,6 +4,9 @@ node_modules/
 # CDK
 cdk/cdk.out/
 cdk/dist/
+
+# Build artifacts
+lambda-edge-build/
 *.js
 *.d.ts
 !cloudfront-function/bot-validator.js

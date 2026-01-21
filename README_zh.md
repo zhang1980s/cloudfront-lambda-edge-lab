@@ -309,6 +309,112 @@ cloudfront-lambda-edge-lab/
 4. 对比 CloudWatch 指标中的延迟
 5. 查看两个函数的日志
 
+## 访问日志
+
+默认启用 CloudFront 访问日志，用于监控机器人验证的通过/拒绝率。日志写入 S3 存储桶，保留期为 30 天。
+
+### 日志记录内容
+
+每条日志包含：
+- `sc-status` - 响应状态码（200 = 通过，403 = 拒绝）
+- `cs-uri-stem` - 请求路径（`/cf-function/*` 或 `/lambda-edge/*`）
+- `date`, `time` - 时间戳
+- `c-ip` - 客户端 IP 地址
+- `cs-method` - HTTP 方法
+- `x-edge-result-type` - 缓存结果（被拒绝请求显示 Error）
+
+### 查询日志
+
+**方式 A：AWS CLI（快速检查）**
+
+```bash
+# 列出最近的日志文件
+aws s3 ls s3://<AccessLogBucketName>/cloudfront-logs/
+
+# 下载并查看日志文件
+aws s3 cp s3://<AccessLogBucketName>/cloudfront-logs/XXXX.gz - | gunzip | head -20
+```
+
+**方式 B：Athena（推荐用于分析）**
+
+1. 创建 Athena 表：
+
+```sql
+CREATE EXTERNAL TABLE cloudfront_logs (
+  `date` DATE,
+  `time` STRING,
+  `x-edge-location` STRING,
+  `sc-bytes` BIGINT,
+  `c-ip` STRING,
+  `cs-method` STRING,
+  `cs-host` STRING,
+  `cs-uri-stem` STRING,
+  `sc-status` INT,
+  `cs-referer` STRING,
+  `cs-user-agent` STRING,
+  `cs-uri-query` STRING,
+  `cs-cookie` STRING,
+  `x-edge-result-type` STRING,
+  `x-edge-request-id` STRING,
+  `x-host-header` STRING,
+  `cs-protocol` STRING,
+  `cs-bytes` BIGINT,
+  `time-taken` FLOAT,
+  `x-forwarded-for` STRING,
+  `ssl-protocol` STRING,
+  `ssl-cipher` STRING,
+  `x-edge-response-result-type` STRING,
+  `cs-protocol-version` STRING,
+  `fle-status` STRING,
+  `fle-encrypted-fields` INT,
+  `c-port` INT,
+  `time-to-first-byte` FLOAT,
+  `x-edge-detailed-result-type` STRING,
+  `sc-content-type` STRING,
+  `sc-content-len` BIGINT,
+  `sc-range-start` BIGINT,
+  `sc-range-end` BIGINT
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
+LOCATION 's3://<AccessLogBucketName>/cloudfront-logs/'
+TBLPROPERTIES ('skip.header.line.count'='2');
+```
+
+2. 查询通过/拒绝统计：
+
+```sql
+-- 按路径统计通过与拒绝数量
+SELECT
+  CASE
+    WHEN "cs-uri-stem" LIKE '/cf-function/%' THEN 'CloudFront Function'
+    WHEN "cs-uri-stem" LIKE '/lambda-edge/%' THEN 'Lambda@Edge'
+    ELSE 'Other'
+  END AS validator,
+  CASE
+    WHEN "sc-status" = 200 THEN '通过'
+    WHEN "sc-status" = 403 THEN '拒绝'
+    ELSE '其他'
+  END AS result,
+  COUNT(*) AS request_count
+FROM cloudfront_logs
+WHERE "cs-uri-stem" LIKE '/cf-function/%'
+   OR "cs-uri-stem" LIKE '/lambda-edge/%'
+GROUP BY 1, 2
+ORDER BY 1, 2;
+```
+
+### 日志相关堆栈输出
+
+- `AccessLogBucketName` - 包含 CloudFront 访问日志的 S3 存储桶
+- `AthenaQueryExample` - 用于分析机器人验证结果的 Athena 查询示例
+
+### 说明
+
+- 日志每 5-10 分钟交付一次（非实时）
+- 日志文件为 gzip 压缩的制表符分隔格式
+- 30 天保留期可控制成本
+- 如需实时分析，可考虑 CloudFront 实时日志发送到 Kinesis
+
 ## 注意事项
 
 - Lambda@Edge 必须部署在 us-east-1

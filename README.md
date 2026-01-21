@@ -10,6 +10,69 @@ Build a lab to understand how Lambda@Edge and CloudFront Functions work with Clo
 - Validation uses crypto/SHA256 functions
 - Invalid requests rejected immediately at the edge (403 response)
 
+## Secret Management Architecture
+
+This lab demonstrates two different approaches for storing secrets at the edge:
+
+### CloudFront Functions + KeyValueStore
+
+CloudFront Functions cannot make network calls, so they cannot access AWS services like Secrets Manager. Instead, they use **CloudFront KeyValueStore** - a globally distributed key-value data store designed specifically for CloudFront Functions.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    CloudFront Function                       │
+│  ┌─────────────┐      ┌─────────────────────────────────┐  │
+│  │   Request   │ ───▶ │  KeyValueStore (global, <1ms)   │  │
+│  │  Validation │ ◀─── │  key: "bot-secret-key"          │  │
+│  └─────────────┘      └─────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key characteristics:**
+- Sub-millisecond read latency (data is co-located with function)
+- No network calls required (in-memory access)
+- Eventually consistent (updates propagate globally in ~seconds)
+- Maximum 5MB total storage per KeyValueStore
+- Requires JavaScript Runtime 2.0
+
+### Lambda@Edge + Secrets Manager
+
+Lambda@Edge has full network access and can call AWS services. This implementation uses **AWS Secrets Manager** to securely store and retrieve secrets.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Lambda@Edge                             │
+│  ┌─────────────┐      ┌─────────────────────────────────┐  │
+│  │   Request   │ ───▶ │  Secrets Manager (us-east-1)    │  │
+│  │  Validation │ ◀─── │  secret: "bot-validator-secret" │  │
+│  └─────────────┘      └─────────────────────────────────┘  │
+│         │                                                    │
+│         ▼                                                    │
+│  ┌─────────────────┐                                        │
+│  │  In-Memory Cache │  (5-minute TTL)                       │
+│  └─────────────────┘                                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key characteristics:**
+- Network call to Secrets Manager (~50-100ms first call)
+- Secret caching reduces subsequent latency
+- Centralized secret management with rotation support
+- Full Secrets Manager features (versioning, audit, rotation)
+- Lambda@Edge must call us-east-1 (where secrets are stored)
+
+### Comparison
+
+| Aspect | CloudFront Functions + KVS | Lambda@Edge + Secrets Manager |
+|--------|---------------------------|------------------------------|
+| **Latency** | Sub-millisecond | ~50-100ms (first call), cached after |
+| **Network Required** | No | Yes |
+| **Secret Rotation** | Manual (API call to update KVS) | Automatic with Secrets Manager |
+| **Audit Trail** | CloudTrail for KVS API calls | Full Secrets Manager audit |
+| **Max Secret Size** | 1KB per value | 64KB per secret |
+| **Cost** | Free (included with CF Functions) | Secrets Manager pricing |
+| **Cold Start Impact** | None | Additional ~50-100ms |
+
 ## Bot Validation Design
 
 ### HTTP Headers
@@ -142,23 +205,26 @@ Backend validates → blocks spoofed device traffic
 
 ### Phase 1: Project Setup
 
-**Files to create:**
+**Files structure:**
 ```
 cloudfront-lambda-edge-lab/
-├── README.md                    # Lab overview (update existing)
+├── README.md                    # Lab overview
+├── CLAUDE.md                    # AI assistant guidance
 ├── cloudfront-function/
-│   └── bot-validator.js         # CloudFront Function code
+│   └── bot-validator.js         # CloudFront Function with KeyValueStore
 ├── lambda-edge/
-│   └── index.js                 # Lambda@Edge handler
+│   ├── index.js                 # Lambda@Edge handler with Secrets Manager
+│   └── package.json             # Dependencies (@aws-sdk/client-secrets-manager)
 ├── cdk/
 │   ├── lib/
-│   │   └── edge-lab-stack.ts    # CDK stack
+│   │   └── edge-lab-stack.ts    # CDK stack (with canary deployment support)
 │   ├── bin/
 │   │   └── app.ts               # CDK app entry
 │   ├── package.json
 │   └── cdk.json
 └── test/
-    └── test-requests.sh         # Test script
+    ├── test-requests.sh         # Test script
+    └── test-canary.sh           # Canary deployment test script
 ```
 
 ### Phase 2: CloudFront Function Implementation
@@ -166,7 +232,8 @@ cloudfront-lambda-edge-lab/
 **File: `cloudfront-function/bot-validator.js`**
 
 - Use JavaScript Runtime 2.0
-- Import Crypto module for SHA256
+- Import `crypto` module for SHA256 and `cloudfront` module for KeyValueStore
+- Read secret key from CloudFront KeyValueStore
 - Read 2 security headers from viewer request
 - Compute hash and validate
 - Return 403 response if validation fails
@@ -176,8 +243,10 @@ cloudfront-lambda-edge-lab/
 
 **File: `lambda-edge/index.js`**
 
-- Node.js runtime
-- Use native crypto module for SHA256
+- Node.js 20.x runtime
+- Use AWS SDK v3 (`@aws-sdk/client-secrets-manager`)
+- Fetch secret from Secrets Manager in us-east-1
+- Cache secret in memory (5-minute TTL) to reduce latency
 - Same validation logic as CloudFront Function
 - Handler for viewer-request event
 - Return 403 or allow passthrough
@@ -186,15 +255,33 @@ cloudfront-lambda-edge-lab/
 
 **File: `cdk/lib/edge-lab-stack.ts`**
 
+- Create Secrets Manager secret for Lambda@Edge
+- Create CloudFront KeyValueStore for CloudFront Functions
 - Create S3 bucket as origin (simple test origin)
 - Create CloudFront distribution
-- Deploy CloudFront Function
-- Deploy Lambda@Edge function (us-east-1)
+- Deploy CloudFront Function with KeyValueStore association
+- Deploy Lambda@Edge function with Secrets Manager permissions (us-east-1)
 - Create 2 cache behaviors to test each approach:
   - `/cf-function/*` → CloudFront Function validation
   - `/lambda-edge/*` → Lambda@Edge validation
 
-### Phase 5: Testing & Comparison
+### Phase 5: Post-Deployment Setup
+
+After deploying the CDK stack, you must initialize the KeyValueStore with the secret:
+
+```bash
+# The command is provided in the stack outputs
+# Example:
+aws cloudfront-keyvaluestore put-key \
+  --kvs-arn <KeyValueStoreArn from output> \
+  --key bot-secret-key \
+  --value my-secret-key-2024 \
+  --if-match $(aws cloudfront-keyvaluestore describe-key-value-store \
+    --kvs-arn <KeyValueStoreArn from output> \
+    --query 'ETag' --output text)
+```
+
+### Phase 6: Testing & Comparison
 
 **Test scenarios:**
 1. Valid headers → Request passes through
@@ -215,6 +302,7 @@ cloudfront-lambda-edge-lab/
 | Scale | Millions req/sec | ~10K/sec per region |
 | Deploy Region | All edge locations | us-east-1 then replicated |
 | Network Access | No | Yes |
+| Secret Storage | CloudFront KeyValueStore | AWS Secrets Manager |
 | Best For | Simple, fast validation | Complex logic, external calls |
 
 ## Cost Comparison
@@ -309,8 +397,201 @@ cloudfront-lambda-edge-lab/
 4. Compare CloudWatch metrics for latency
 5. Review logs for both functions
 
+## Canary Deployment
+
+This lab includes support for **CloudFront Continuous Deployment** to safely roll out changes to CloudFront Functions using a canary deployment pattern.
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         CloudFront Distribution                          │
+│                                                                          │
+│   Normal Request ──────────────────────────────▶ PRIMARY Distribution    │
+│                                                   (Production Function)  │
+│                                                                          │
+│   Request with Header ─────────────────────────▶ STAGING Distribution    │
+│   "aws-cf-cd-staging: true"                       (Canary Function)      │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+CloudFront Continuous Deployment creates a **staging distribution** that mirrors your primary distribution. Traffic is routed to staging based on:
+- **Header-based routing**: Requests with `aws-cf-cd-staging: true` header go to staging
+- **Weight-based routing**: A percentage (1-15%) of all traffic goes to staging
+
+### Enable Canary Deployment
+
+```bash
+# Deploy with canary mode enabled
+cd cdk
+cdk deploy --context canary=true
+```
+
+This creates:
+- A staging distribution with your CloudFront Function changes
+- A continuous deployment policy with header-based routing
+- The primary distribution linked to the staging distribution
+
+### Test the Staging Distribution
+
+```bash
+# Test PRIMARY distribution (normal request)
+curl -H "X-Bot-Token: $TOKEN" \
+     -H "X-Bot-Signature: $SIGNATURE" \
+     https://<distribution>/cf-function/test.html
+
+# Test STAGING distribution (with canary header)
+curl -H "aws-cf-cd-staging: true" \
+     -H "X-Bot-Token: $TOKEN" \
+     -H "X-Bot-Signature: $SIGNATURE" \
+     https://<distribution>/cf-function/test.html
+
+# Run the canary test suite
+./test/test-canary.sh <distribution-domain>
+```
+
+### Promote Staging to Primary
+
+When satisfied with testing, promote the staging configuration to primary:
+
+```bash
+# Get the distribution ETags
+PRIMARY_ETAG=$(aws cloudfront get-distribution --id <PRIMARY_ID> --query 'ETag' --output text)
+
+# Promote staging to primary
+aws cloudfront update-distribution-with-staging-config \
+  --id <PRIMARY_ID> \
+  --staging-distribution-id <STAGING_ID> \
+  --if-match $PRIMARY_ETAG
+```
+
+### Canary Deployment Outputs
+
+When deployed with `--context canary=true`, additional outputs are provided:
+- `StagingDistributionDomainName` - Staging distribution domain
+- `StagingDistributionId` - Staging distribution ID (for promotion)
+- `CanaryTestCommand` - Ready-to-use curl command for testing staging
+- `PromoteCommand` - Command template for promoting staging to primary
+
+### Lambda@Edge Canary Deployment
+
+Lambda@Edge does **not** support aliases in CloudFront edge associations. For Lambda@Edge canary deployments, consider:
+- Using AWS CodeDeploy with SAM for automated traffic shifting
+- Manual version management with deployment scripts
+- Multiple cache behaviors pointing to different Lambda versions
+
+## Access Logs
+
+CloudFront Access Logs are enabled by default to monitor bot validation pass/fail rates. Logs are written to an S3 bucket with a 30-day retention policy.
+
+### What Gets Logged
+
+Each log entry includes:
+- `sc-status` - Response status code (200 = passed, 403 = blocked)
+- `cs-uri-stem` - Request path (`/cf-function/*` or `/lambda-edge/*`)
+- `date`, `time` - Timestamp
+- `c-ip` - Client IP address
+- `cs-method` - HTTP method
+- `x-edge-result-type` - Cache result (Error for blocked requests)
+
+### Querying Logs
+
+**Option A: AWS CLI (Quick Check)**
+
+```bash
+# List recent log files
+aws s3 ls s3://<AccessLogBucketName>/cloudfront-logs/
+
+# Download and inspect a log file
+aws s3 cp s3://<AccessLogBucketName>/cloudfront-logs/XXXX.gz - | gunzip | head -20
+```
+
+**Option B: Athena (Recommended for Analysis)**
+
+1. Create Athena table:
+
+```sql
+CREATE EXTERNAL TABLE cloudfront_logs (
+  `date` DATE,
+  `time` STRING,
+  `x-edge-location` STRING,
+  `sc-bytes` BIGINT,
+  `c-ip` STRING,
+  `cs-method` STRING,
+  `cs-host` STRING,
+  `cs-uri-stem` STRING,
+  `sc-status` INT,
+  `cs-referer` STRING,
+  `cs-user-agent` STRING,
+  `cs-uri-query` STRING,
+  `cs-cookie` STRING,
+  `x-edge-result-type` STRING,
+  `x-edge-request-id` STRING,
+  `x-host-header` STRING,
+  `cs-protocol` STRING,
+  `cs-bytes` BIGINT,
+  `time-taken` FLOAT,
+  `x-forwarded-for` STRING,
+  `ssl-protocol` STRING,
+  `ssl-cipher` STRING,
+  `x-edge-response-result-type` STRING,
+  `cs-protocol-version` STRING,
+  `fle-status` STRING,
+  `fle-encrypted-fields` INT,
+  `c-port` INT,
+  `time-to-first-byte` FLOAT,
+  `x-edge-detailed-result-type` STRING,
+  `sc-content-type` STRING,
+  `sc-content-len` BIGINT,
+  `sc-range-start` BIGINT,
+  `sc-range-end` BIGINT
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
+LOCATION 's3://<AccessLogBucketName>/cloudfront-logs/'
+TBLPROPERTIES ('skip.header.line.count'='2');
+```
+
+2. Query pass/fail counts:
+
+```sql
+-- Count passed vs blocked by path
+SELECT
+  CASE
+    WHEN "cs-uri-stem" LIKE '/cf-function/%' THEN 'CloudFront Function'
+    WHEN "cs-uri-stem" LIKE '/lambda-edge/%' THEN 'Lambda@Edge'
+    ELSE 'Other'
+  END AS validator,
+  CASE
+    WHEN "sc-status" = 200 THEN 'PASSED'
+    WHEN "sc-status" = 403 THEN 'BLOCKED'
+    ELSE 'OTHER'
+  END AS result,
+  COUNT(*) AS request_count
+FROM cloudfront_logs
+WHERE "cs-uri-stem" LIKE '/cf-function/%'
+   OR "cs-uri-stem" LIKE '/lambda-edge/%'
+GROUP BY 1, 2
+ORDER BY 1, 2;
+```
+
+### Stack Outputs for Logging
+
+- `AccessLogBucketName` - S3 bucket containing CloudFront access logs
+- `AthenaQueryExample` - Example Athena query for analyzing bot validation results
+
+### Notes
+
+- Logs are delivered every 5-10 minutes (not real-time)
+- Log files are gzipped and tab-delimited
+- 30-day retention keeps costs manageable
+- For real-time analysis, consider CloudFront Real-Time Logs to Kinesis
+
 ## Notes
 
 - Lambda@Edge must be deployed in us-east-1
-- CloudFront Function uses Runtime 2.0 for crypto support
+- CloudFront Function uses Runtime 2.0 for crypto and KeyValueStore support
 - Both approaches validate at viewer-request stage
+- **Important**: After CDK deployment, you must initialize the KeyValueStore with the secret key (command provided in stack outputs)
+- Lambda@Edge caches the secret for 5 minutes to minimize Secrets Manager calls
+- Lambda@Edge cannot use environment variables for viewer-request triggers, so the secret ARN is injected at build time

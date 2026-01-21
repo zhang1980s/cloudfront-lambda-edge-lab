@@ -1,16 +1,69 @@
 'use strict';
 
 const crypto = require('crypto');
+const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 
-// Shared secret for HMAC validation (in production, use AWS Secrets Manager or Parameter Store)
-const SECRET_KEY = 'my-secret-key-2024';
+// Secret ARN is injected during CDK deployment (Lambda@Edge doesn't support env vars)
+// This placeholder will be replaced with the actual secret ARN
+const SECRET_ARN = 'SECRET_ARN_PLACEHOLDER';
 
 // Timestamp tolerance in seconds (5 minutes)
 const TIMESTAMP_TOLERANCE = 300;
 
+// Cache the secret to avoid repeated Secrets Manager calls
+let cachedSecret = null;
+let cacheExpiry = 0;
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+// Lambda@Edge runs in multiple regions, use us-east-1 where the secret is stored
+const secretsClient = new SecretsManagerClient({ region: 'us-east-1' });
+
+async function getSecret() {
+    const now = Date.now();
+
+    // Return cached secret if still valid
+    if (cachedSecret && now < cacheExpiry) {
+        return cachedSecret;
+    }
+
+    try {
+        const command = new GetSecretValueCommand({
+            SecretId: SECRET_ARN,
+        });
+
+        const response = await secretsClient.send(command);
+
+        // Parse the secret value (stored as JSON with 'secretKey' field)
+        const secretData = JSON.parse(response.SecretString);
+        cachedSecret = secretData.secretKey;
+        cacheExpiry = now + CACHE_TTL;
+
+        return cachedSecret;
+    } catch (error) {
+        console.error('Failed to retrieve secret from Secrets Manager:', error);
+        throw error;
+    }
+}
+
 exports.handler = async (event) => {
     const request = event.Records[0].cf.request;
     const headers = request.headers;
+
+    // Get secret key from Secrets Manager
+    let secretKey;
+    try {
+        secretKey = await getSecret();
+    } catch (error) {
+        console.error('Configuration error:', error);
+        return {
+            status: '500',
+            statusDescription: 'Internal Server Error',
+            headers: {
+                'content-type': [{ key: 'Content-Type', value: 'application/json' }]
+            },
+            body: JSON.stringify({ error: 'Configuration error' })
+        };
+    }
 
     // Extract bot validation headers (headers are lowercase in Lambda@Edge)
     const token = headers['x-bot-token'] ? headers['x-bot-token'][0].value : null;
@@ -45,7 +98,7 @@ exports.handler = async (event) => {
 
     // Compute expected signature using HMAC-SHA256
     const expectedSignature = crypto
-        .createHmac('sha256', SECRET_KEY)
+        .createHmac('sha256', secretKey)
         .update(token)
         .digest('hex');
 

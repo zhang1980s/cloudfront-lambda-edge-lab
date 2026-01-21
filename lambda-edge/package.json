@@ -1,0 +1,9 @@
+{
+  "name": "bot-validator-lambda-edge",
+  "version": "1.0.0",
+  "description": "Lambda@Edge bot validator with Secrets Manager integration",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.0.0"
+  }
+}
