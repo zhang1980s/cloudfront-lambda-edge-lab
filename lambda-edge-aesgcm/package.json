@@ -1,0 +1,22 @@
+{
+  "name": "lambda-edge-aesgcm-validator",
+  "version": "1.0.0",
+  "description": "Lambda@Edge bot validator using AES-256-GCM encrypted tokens",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "lambda",
+    "edge",
+    "cloudfront",
+    "aes-gcm",
+    "encryption",
+    "authentication"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.400.0"
+  }
+}

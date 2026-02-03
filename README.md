@@ -474,12 +474,175 @@ When deployed with `--context canary=true`, additional outputs are provided:
 - `CanaryTestCommand` - Ready-to-use curl command for testing staging
 - `PromoteCommand` - Command template for promoting staging to primary
 
-### Lambda@Edge Canary Deployment
+### Lambda@Edge Canary Deployment with Weighted Aliases
 
-Lambda@Edge does **not** support aliases in CloudFront edge associations. For Lambda@Edge canary deployments, consider:
-- Using AWS CodeDeploy with SAM for automated traffic shifting
-- Manual version management with deployment scripts
-- Multiple cache behaviors pointing to different Lambda versions
+Lambda@Edge supports **canary deployment using Lambda aliases with weighted routing**. This allows gradual rollout of new Lambda@Edge code by routing a percentage of traffic to the new version.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Lambda@Edge Alias "live"                        │
+│                                                                          │
+│   90% Traffic ────────────────────────────────────▶ Version 5 (Stable)  │
+│                                                                          │
+│   10% Traffic ────────────────────────────────────▶ Version 6 (Canary)  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### How It Works
+
+1. CDK creates Lambda aliases (`live`) for each Lambda@Edge function
+2. CloudFront initially uses the specific Lambda version (CDK limitation)
+3. You can optionally update CloudFront to use the alias ARN for full alias-based routing
+4. Update alias weights to control traffic distribution between versions
+5. Lambda handles the traffic splitting at invocation time
+
+#### Setup (Provided by CDK)
+
+The CDK stack automatically creates:
+- Lambda alias `live` pointing to the current version (for both HMAC and AES-GCM functions)
+- CloudFront initially configured to use the version ARN (can be updated to alias)
+
+**Option A: Version-based Canary (Simpler)**
+- Deploy new code → Creates new version
+- Update alias weights → Traffic splits at Lambda level
+- Requires updating CloudFront to use alias ARN (one-time)
+
+**Option B: Multiple Versions via Redeployment**
+- Each CDK deploy creates a new Lambda version
+- CloudFront automatically uses the new version
+- Rollback by redeploying previous code
+
+#### (Optional) Update CloudFront to Use Alias ARN
+
+For full alias-based traffic splitting, update CloudFront to use the alias ARN instead of the version ARN. This is a one-time setup:
+
+```bash
+# Get current distribution config
+aws cloudfront get-distribution-config --id <DistributionId> > dist-config.json
+
+# Edit dist-config.json:
+# Change LambdaFunctionARN from version ARN to alias ARN
+# From: arn:aws:lambda:us-east-1:123456789:function:MyFunc:1
+# To:   arn:aws:lambda:us-east-1:123456789:function:MyFunc:live
+
+# Extract ETag and update distribution
+ETAG=$(jq -r '.ETag' dist-config.json)
+jq '.DistributionConfig' dist-config.json > update-config.json
+aws cloudfront update-distribution --id <DistributionId> --if-match $ETAG --distribution-config file://update-config.json
+```
+
+#### Deploy a New Lambda Version
+
+When you make code changes and deploy:
+
+```bash
+# Deploy the stack (creates new Lambda version)
+cd cdk
+cdk deploy
+
+# List all versions to find the new version number
+aws lambda list-versions-by-function \
+  --function-name <LambdaEdgeFunctionName> \
+  --region us-east-1
+```
+
+#### Enable Canary Routing (10% to New Version)
+
+```bash
+# Route 10% traffic to new version, 90% stays on current
+aws lambda update-alias \
+  --function-name <LambdaEdgeFunctionName> \
+  --name live \
+  --routing-config 'AdditionalVersionWeights={"<NEW_VERSION>":0.1}' \
+  --region us-east-1
+```
+
+Replace `<NEW_VERSION>` with the version number (e.g., "6").
+
+#### Monitor Canary Traffic
+
+Monitor CloudWatch metrics for both versions:
+- Check error rates
+- Compare latency distributions
+- Review CloudWatch Logs
+
+```bash
+# Get alias configuration to see current routing
+aws lambda get-alias \
+  --function-name <LambdaEdgeFunctionName> \
+  --name live \
+  --region us-east-1
+```
+
+#### Gradual Traffic Shift
+
+Increase canary traffic progressively:
+
+```bash
+# 25% to canary
+aws lambda update-alias \
+  --function-name <LambdaEdgeFunctionName> \
+  --name live \
+  --routing-config 'AdditionalVersionWeights={"<NEW_VERSION>":0.25}' \
+  --region us-east-1
+
+# 50% to canary
+aws lambda update-alias \
+  --function-name <LambdaEdgeFunctionName> \
+  --name live \
+  --routing-config 'AdditionalVersionWeights={"<NEW_VERSION>":0.5}' \
+  --region us-east-1
+```
+
+#### Promote Canary to 100%
+
+When confident, promote the canary version:
+
+```bash
+# Update alias to point to new version (100% traffic)
+aws lambda update-alias \
+  --function-name <LambdaEdgeFunctionName> \
+  --name live \
+  --function-version <NEW_VERSION> \
+  --routing-config 'AdditionalVersionWeights={}' \
+  --region us-east-1
+```
+
+#### Rollback
+
+If issues are detected, remove canary routing:
+
+```bash
+# Rollback: Remove additional version weights (100% to stable)
+aws lambda update-alias \
+  --function-name <LambdaEdgeFunctionName> \
+  --name live \
+  --routing-config 'AdditionalVersionWeights={}' \
+  --region us-east-1
+```
+
+#### Lambda Canary Outputs
+
+After deployment, these outputs help with canary management:
+- `LambdaEdgeFunctionName` - Function name for AWS CLI commands
+- `LambdaEdgeAliasArn` - Alias ARN used by CloudFront
+- `LambdaEdgeCurrentVersionArn` - Current version ARN
+- `LambdaCanarySetupCommand` - Ready-to-use canary setup command
+- `LambdaCanaryPromoteCommand` - Ready-to-use promotion command
+- `LambdaListVersionsCommand` - Command to list all versions
+
+#### Comparison: CloudFront vs Lambda@Edge Canary
+
+| Aspect | CloudFront Continuous Deployment | Lambda Weighted Aliases |
+|--------|----------------------------------|------------------------|
+| **Applies To** | CloudFront Functions | Lambda@Edge |
+| **Traffic Routing** | Header-based or weight-based | Weight-based only |
+| **Routing Location** | CloudFront edge | Lambda service |
+| **Config Change** | CloudFront deployment | Lambda alias update |
+| **Rollback Speed** | Seconds (alias update) | Seconds (alias update) |
+| **Max Canary Weight** | 15% (weight-based) | 100% |
+| **Version Management** | Automatic | Manual |
 
 ## Access Logs
 
@@ -586,6 +749,165 @@ ORDER BY 1, 2;
 - Log files are gzipped and tab-delimited
 - 30-day retention keeps costs manageable
 - For real-time analysis, consider CloudFront Real-Time Logs to Kinesis
+
+## When to Use AES-GCM Instead of HMAC
+
+While HMAC-SHA256 is ideal for simple request authentication, **AES-GCM** provides better security in scenarios where you need **confidentiality** (hiding token contents) in addition to authentication.
+
+### Why CloudFront Functions Cannot Use AES-GCM
+
+CloudFront Functions crypto module only supports:
+- Hashing: `md5`, `sha1`, `sha256`
+- HMAC: `HMAC-md5`, `HMAC-sha1`, `HMAC-sha256`
+
+**Not supported**: AES-GCM, RSA, ECDSA, or any symmetric/asymmetric encryption.
+
+For AES-GCM validation, you must use **Lambda@Edge** which has full Node.js crypto support.
+
+### Scenarios Where AES-GCM Provides Better Security
+
+#### 1. Encrypted API Tokens with Hidden Claims
+
+```
+HMAC approach:
+  X-Bot-Token: 1706000000            ← Visible timestamp
+  X-Bot-Signature: a3f2b1c4d5e6...   ← Anyone can see the token
+
+AES-GCM approach:
+  X-Auth-Token: <nonce>:<ciphertext>:<tag>  ← Encrypted, opaque
+
+  Decrypts to:
+  {
+    "user_id": "user_12345",
+    "device_id": "iphone_abc123",
+    "permissions": ["read", "write"],
+    "exp": 1706003600
+  }
+```
+
+**Benefit**: Token contents are hidden from attackers and MITM observers.
+
+#### 2. Device Binding / Anti-Token-Theft
+
+```
+Scenario: Attacker steals token from compromised device
+
+HMAC token:
+  Attacker can use stolen token from ANY device ❌
+
+AES-GCM encrypted token contains:
+  { device_fingerprint: "sha256(device_id+hardware_id)" }
+
+  → Server decrypts and validates device fingerprint
+  → Token only works on original device ✅
+  → Fingerprint is hidden from attacker (can't forge)
+```
+
+#### 3. Rate Limiting with Hidden User Identity
+
+```
+Problem: Rate limiting by user_id exposes user identity in headers
+
+HMAC approach:
+  X-User-ID: user_12345        ← Visible to network observers!
+  X-Signature: HMAC(...)
+
+AES-GCM approach:
+  X-Auth-Token: <encrypted>    ← Contains user_id inside
+
+Server decrypts → extracts user_id → applies rate limit
+Attacker cannot see which user is being rate-limited
+```
+
+#### 4. Secure Refresh Token Rotation
+
+```
+Mobile App Refresh Token Flow with AES-GCM:
+
+┌─────────────┐                    ┌─────────────┐
+│  Mobile App │                    │  API Server │
+└──────┬──────┘                    └──────┬──────┘
+       │                                  │
+       │  Refresh Token (AES-GCM encrypted)
+       │  Contains:                       │
+       │  - user_id                       │
+       │  - token_generation: 5           │
+       │  - issued_at                     │
+       │────────────────────────────────► │
+       │                                  │ Decrypt, validate generation
+       │                                  │ Issue new token (generation: 6)
+       │◄─────────────────────────────────│
+       │  New Refresh Token               │
+       │  (generation: 6, encrypted)      │
+
+If attacker steals token:
+- Server tracks: current_generation = 6
+- Attacker uses stolen token (generation = 5)
+- Server detects: 5 < 6 → REJECT + revoke all tokens
+- Hidden generation number prevents attacker from forging
+```
+
+#### 5. Sensitive Data Protection (HIPAA, PCI Compliance)
+
+```
+Scenario: Mobile health app sending medical data
+
+Without AES-GCM (HTTPS + HMAC):
+  POST /api/health-records
+  Body: { "blood_pressure": "140/90", "weight": 180 }
+
+  → TLS terminated at CDN/Load Balancer
+  → Data visible in WAF logs, monitoring systems ❌
+
+With AES-GCM payload encryption:
+  POST /api/health-records
+  X-Auth-Token: <nonce>:<encrypted_body>:<tag>
+
+  → Only origin server can decrypt
+  → End-to-end encryption within TLS ✅
+  → Meets compliance requirements
+```
+
+### Comparison: HMAC vs AES-GCM
+
+| Scenario | HMAC | AES-GCM | Recommendation |
+|----------|------|---------|----------------|
+| Simple API authentication | ✅ | ⚠️ Overkill | HMAC |
+| Hidden token claims | ❌ Visible | ✅ Encrypted | AES-GCM |
+| Device binding | ⚠️ Exposed | ✅ Hidden | AES-GCM |
+| Sensitive data in token | ❌ Visible | ✅ Encrypted | AES-GCM |
+| Refresh token security | ⚠️ | ✅ Hidden generation | AES-GCM |
+| Compliance (HIPAA, PCI) | ⚠️ | ✅ Encryption | AES-GCM |
+| Performance | ✅ Faster | ⚠️ Slower | HMAC |
+| CloudFront Functions | ✅ Supported | ❌ Not supported | HMAC |
+| Lambda@Edge | ✅ Supported | ✅ Supported | Either |
+
+### This Lab's AES-GCM Implementation
+
+This lab includes an AES-GCM implementation using Lambda@Edge at `/aes-gcm/*`:
+
+```
+Token Format:
+  X-Auth-Token: <nonce_hex>:<ciphertext_hex>:<auth_tag_hex>
+
+  Where:
+  - nonce: 12 bytes (96 bits) - unique per request
+  - ciphertext: AES-GCM encrypted JSON payload
+  - auth_tag: 16 bytes (128 bits) - authentication tag
+
+Payload (encrypted):
+  {
+    "ts": 1706000000,           // Unix timestamp
+    "device": "device_abc123",   // Device identifier (optional)
+    "data": "custom_data"        // Any additional data
+  }
+```
+
+**Usage:**
+```bash
+# Test AES-GCM validation path
+./test/test-requests.sh <distribution-domain>
+```
 
 ## Notes
 

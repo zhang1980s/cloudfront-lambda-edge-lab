@@ -3,9 +3,9 @@
 const crypto = require('crypto');
 const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 
-// Secret ARN is injected during CDK deployment (Lambda@Edge doesn't support env vars)
-// This placeholder will be replaced with the actual secret ARN
-const SECRET_ARN = 'SECRET_ARN_PLACEHOLDER';
+// Secret name is injected during CDK deployment (Lambda@Edge doesn't support env vars)
+// This placeholder will be replaced with the actual secret name
+const SECRET_NAME = 'SECRET_NAME_PLACEHOLDER';
 
 // Timestamp tolerance in seconds (5 minutes)
 const TIMESTAMP_TOLERANCE = 300;
@@ -28,7 +28,7 @@ async function getSecret() {
 
     try {
         const command = new GetSecretValueCommand({
-            SecretId: SECRET_ARN,
+            SecretId: SECRET_NAME,
         });
 
         const response = await secretsClient.send(command);
