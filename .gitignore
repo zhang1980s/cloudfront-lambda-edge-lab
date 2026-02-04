@@ -11,6 +11,7 @@ lambda-edge-build/
 *.d.ts
 !cloudfront-function/bot-validator.js
 !lambda-edge/index.js
+!lambda-edge-aesgcm/index.js
 !test/test-requests.sh
 
 # IDE
